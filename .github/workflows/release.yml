@@ -17,7 +17,7 @@ permissions:
 jobs:
   upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 2880
     steps:
       - name: Free up disk space
         run: |
