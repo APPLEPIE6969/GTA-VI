@@ -1,0 +1,110 @@
+name: Upload magnet to Hugging Face
+
+on:
+  workflow_dispatch:
+    inputs:
+      magnet:
+        description: Magnet link of the torrent to publish
+        required: true
+        default: "magnet:?xt=urn:btih:465d6a0eac381e68ca77115f44f19f0c968b9590&tr=udp://open.tracker.cl:1337/announce"
+      repo_id:
+        description: Hugging Face dataset to upload to, as username/name (created as public if missing)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Free up disk space
+        run: |
+          # Removes preinstalled toolchains this job doesn't need, which frees tens of GB
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install aria2 and Python packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2
+          pip install --upgrade huggingface_hub bencodepy
+
+      - name: Fetch torrent metadata
+        env:
+          MAGNET: ${{ inputs.magnet }}
+        run: |
+          mkdir meta
+          aria2c \
+            --dir=meta \
+            --bt-metadata-only=true \
+            --bt-save-metadata=true \
+            --enable-dht=true \
+            --bt-stop-timeout=600 \
+            "$MAGNET"
+          ls -l meta
+
+      - name: Download in batches and upload to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          REPO_ID: ${{ inputs.repo_id }}
+        run: |
+          python - <<'EOF'
+          import glob, os, shutil, subprocess, sys
+          import bencodepy
+          from huggingface_hub import HfApi
+
+          GIB = 1024 ** 3
+          torrent = glob.glob("meta/*.torrent")[0]
+          info = bencodepy.decode_from_file(torrent)[b"info"]
+
+          # aria2 numbers files from 1 in the order they appear in the torrent
+          if b"files" in info:
+              files = [(i, f[b"length"]) for i, f in enumerate(info[b"files"], start=1)]
+          else:
+              files = [(1, info[b"length"])]
+
+          # Keep a safety margin of free disk for aria2 and the uploader
+          budget = shutil.disk_usage(".").free - 3 * GIB
+          print(f"{len(files)} files, {sum(s for _, s in files) / GIB:.1f} GiB total, "
+                f"batch budget {budget / GIB:.1f} GiB")
+
+          too_big = [(i, s) for i, s in files if s > budget]
+          if too_big:
+              for i, s in too_big:
+                  print(f"File #{i} is {s / GIB:.1f} GiB and cannot fit on the runner's disk")
+              sys.exit(1)
+
+          # Group files into batches that each fit on the disk
+          batches, current, used = [], [], 0
+          for i, s in files:
+              if current and used + s > budget:
+                  batches.append(current)
+                  current, used = [], 0
+              current.append((i, s))
+              used += s
+          if current:
+              batches.append(current)
+          print(f"Uploading in {len(batches)} batch(es)")
+
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          repo_id = os.environ["REPO_ID"]
+          api.create_repo(repo_id, repo_type="dataset", private=False, exist_ok=True)
+
+          for n, batch in enumerate(batches, start=1):
+              select = ",".join(str(i) for i, _ in batch)
+              print(f"--- Batch {n}/{len(batches)}: files {select} ---", flush=True)
+              subprocess.run([
+                  "aria2c", "--dir=dl", f"--select-file={select}",
+                  "--seed-time=0", "--enable-dht=true", "--file-allocation=none",
+                  "--bt-stop-timeout=600", "--summary-interval=30", torrent,
+              ], check=True)
+              for p in glob.glob("dl/**/*.aria2", recursive=True):
+                  os.remove(p)
+              api.upload_large_folder(repo_id=repo_id, repo_type="dataset", folder_path="dl")
+              shutil.rmtree("dl")  # free the disk for the next batch
+
+          print(f"Uploaded: https://huggingface.co/datasets/{repo_id}")
+          EOF
