@@ -11,20 +11,49 @@ on:
         description: Hugging Face dataset to upload to, as username/name (created as public if missing)
         required: true
 
+# actions:write lets a run queue the next run of this workflow with the built-in GITHUB_TOKEN
 permissions:
   contents: read
+  actions: write
+
+# Runs of this workflow for the same ref line up one after another, never side by side
+concurrency:
+  group: upload-magnet-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 2880
+    # GitHub hard-caps hosted runner jobs at 6 hours; the workflow chains a fresh run before that
+    timeout-minutes: 360
     steps:
       - name: Free up disk space
         run: |
+          date +%s > job_start
           # Removes preinstalled toolchains this job doesn't need, which frees tens of GB
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force || true
           df -h /
+
+      - name: Wait for older runs of this workflow to finish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # A chained run must not touch the dataset while the run that queued it is still alive
+          for i in $(seq 1 70); do
+            older=$(gh run list --workflow=release.yml --limit 50 --json databaseId,status 2>/dev/null \
+              | jq --argjson me "$GITHUB_RUN_ID" \
+                '[.[] | select(.databaseId < $me and (.status == "in_progress" or .status == "queued"))] | length' 2>/dev/null)
+            older=${older:-0}
+            if [ "$older" = "0" ]; then
+              echo "No older run in progress, continuing"
+              exit 0
+            fi
+            echo "Waiting for $older older run(s) to finish (minute $i of 70)..."
+            sleep 60
+          done
+          echo "Older runs still busy after 70 minutes, continuing anyway"
 
       - name: Install aria2 and Python packages
         run: |
@@ -35,51 +64,143 @@ jobs:
       - name: Fetch torrent metadata
         env:
           MAGNET: ${{ inputs.magnet }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           mkdir meta
-          aria2c \
-            --dir=meta \
-            --bt-metadata-only=true \
-            --bt-save-metadata=true \
-            --enable-dht=true \
-            --bt-stop-timeout=600 \
-            "$MAGNET"
+          # Reuse the metadata saved by an earlier run of this workflow, so a chained run
+          # does not have to reach the swarm again just to learn the file list
+          ids=$(gh run list --workflow=release.yml --limit 15 --json databaseId,status 2>/dev/null \
+            | jq -r '.[] | select(.status == "completed") | .databaseId' 2>/dev/null) || true
+          for id in $ids; do
+            if gh run download "$id" --name torrent-metadata --dir meta 2>/dev/null; then
+              echo "Restored torrent metadata from run $id"
+              break
+            fi
+          done
+          # Only keep saved torrents whose info hash matches this magnet
+          if ls meta/*.torrent >/dev/null 2>&1; then
+            python - <<'PY'
+          import base64, glob, hashlib, os, re
+          import bencodepy
+
+          # The artifact may nest files in a subfolder; flatten first
+          for t in glob.glob("meta/**/*.torrent", recursive=True):
+              if os.path.dirname(t) != "meta":
+                  os.replace(t, os.path.join("meta", os.path.basename(t)))
+
+          want = None
+          m = re.search(r"btih:([A-Za-z0-9]+)", os.environ.get("MAGNET", ""), re.I)
+          if m:
+              h = m.group(1)
+              try:
+                  if len(h) == 32:
+                      want = base64.b32decode(h.upper()).hex()
+                  elif len(h) == 40:
+                      want = h.lower()
+              except Exception:
+                  want = None
+
+          for t in glob.glob("meta/*.torrent"):
+              keep = False
+              if want:
+                  try:
+                      info = bencodepy.decode_from_file(t)[b"info"]
+                      keep = hashlib.sha1(bencodepy.encode(info)).hexdigest() == want
+                  except Exception:
+                      keep = False
+              if not keep:
+                  print(f"Discarding {t}: metadata does not match this magnet")
+                  os.remove(t)
+          PY
+          fi
+          if ! ls meta/*.torrent >/dev/null 2>&1; then
+            echo "No saved metadata for this magnet, fetching it from the swarm"
+            aria2c \
+              --dir=meta \
+              --bt-metadata-only=true \
+              --bt-save-metadata=true \
+              --enable-dht=true \
+              --bt-stop-timeout=600 \
+              "$MAGNET"
+          fi
           ls -l meta
+
+      - name: Save torrent metadata for later runs
+        uses: actions/upload-artifact@v4
+        with:
+          name: torrent-metadata
+          path: meta/
+          if-no-files-found: error
 
       - name: Download in batches and upload to Hugging Face
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           REPO_ID: ${{ inputs.repo_id }}
+          MAGNET: ${{ inputs.magnet }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           python - <<'EOF'
-          import glob, os, shutil, subprocess, sys
+          import glob, os, shutil, subprocess, sys, threading, time
           import bencodepy
           from huggingface_hub import HfApi
 
           GIB = 1024 ** 3
-          torrent = glob.glob("meta/*.torrent")[0]
+          JOB_LIMIT_MIN = 360      # GitHub kills hosted runner jobs after 6 hours
+          CHAIN_AT_MIN = 300       # queue the next run at the 5 hour mark while work remains
+          STOP_BATCHES_MIN = 315   # stop starting new batches after 5h15m and wind down
+
+          job_start = float(open("job_start").read().strip())
+          def job_minutes():
+              return (time.time() - job_start) / 60
+
+          torrent = glob.glob("meta/**/*.torrent", recursive=True)[0]
           info = bencodepy.decode_from_file(torrent)[b"info"]
+          name = info[b"name"].decode()
 
           # aria2 numbers files from 1 in the order they appear in the torrent
           if b"files" in info:
-              files = [(i, f[b"length"]) for i, f in enumerate(info[b"files"], start=1)]
+              # path inside dl/ (and therefore in the dataset) starts with the torrent's folder name
+              files = [
+                  (i, f[b"length"], "/".join([name] + [p.decode() for p in f[b"path"]]))
+                  for i, f in enumerate(info[b"files"], start=1)
+              ]
           else:
-              files = [(1, info[b"length"])]
+              files = [(1, info[b"length"], name)]
+          index_to_rel = {i: rel for i, _, rel in files}
+
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          repo_id = os.environ["REPO_ID"]
+          api.create_repo(repo_id, repo_type="dataset", private=False, exist_ok=True)
+
+          # Files already in the dataset were uploaded by an earlier run; only fetch the rest
+          try:
+              existing = set(api.list_repo_files(repo_id, repo_type="dataset"))
+          except Exception as e:
+              print(f"Could not list the dataset ({e}); assuming nothing is uploaded yet")
+              existing = set()
+          todo = [f for f in files if f[2] not in existing]
+          print(f"{len(files)} file(s) total, {len(files) - len(todo)} already in the dataset, "
+                f"{len(todo)} to go, {sum(s for _, s, _ in files) / GIB:.1f} GiB total")
+
+          if not todo:
+              print(f"Nothing left to do: https://huggingface.co/datasets/{repo_id}")
+              sys.exit(0)
 
           # Keep a safety margin of free disk for aria2 and the uploader
           budget = shutil.disk_usage(".").free - 3 * GIB
-          print(f"{len(files)} files, {sum(s for _, s in files) / GIB:.1f} GiB total, "
-                f"batch budget {budget / GIB:.1f} GiB")
+          print(f"batch budget {budget / GIB:.1f} GiB")
 
-          too_big = [(i, s) for i, s in files if s > budget]
+          too_big = [(i, s) for i, s, _ in todo if s > budget]
           if too_big:
               for i, s in too_big:
                   print(f"File #{i} is {s / GIB:.1f} GiB and cannot fit on the runner's disk")
               sys.exit(1)
 
-          # Group files into batches that each fit on the disk
+          # Group the remaining files into batches that each fit on the disk
           batches, current, used = [], [], 0
-          for i, s in files:
+          for i, s, _ in todo:
               if current and used + s > budget:
                   batches.append(current)
                   current, used = [], 0
@@ -89,22 +210,92 @@ jobs:
               batches.append(current)
           print(f"Uploading in {len(batches)} batch(es)")
 
-          api = HfApi(token=os.environ["HF_TOKEN"])
-          repo_id = os.environ["REPO_ID"]
-          api.create_repo(repo_id, repo_type="dataset", private=False, exist_ok=True)
+          # ---- Chaining: when the job time runs out, a fresh workflow run takes over ----
+          chain_lock = threading.Lock()
+          chained = {"done": False}
+          all_uploaded = {"flag": False}
 
+          def chain_next_run(reason):
+              with chain_lock:
+                  if chained["done"]:
+                      return
+                  chained["done"] = True
+              print(f"Chaining a new workflow run ({reason}) with the same magnet and dataset.", flush=True)
+              for attempt in range(1, 4):
+                  r = subprocess.run(
+                      ["gh", "workflow", "run", "release.yml",
+                       "--ref", os.environ["GITHUB_REF_NAME"],
+                       "-f", f"magnet={os.environ['MAGNET']}",
+                       "-f", f"repo_id={repo_id}"],
+                      capture_output=True, text=True)
+                  if r.returncode == 0:
+                      print("Next run queued. It waits for this job to end, then uploads "
+                            "the files that are still missing.", flush=True)
+                      return
+                  print(f"gh workflow run attempt {attempt} failed: {(r.stderr or '').strip()}", flush=True)
+                  time.sleep(30)
+              chained["done"] = False  # give the wind-down path another chance
+              print("Automatic chaining failed; rerun the workflow manually to resume.", flush=True)
+
+          def watchdog():
+              while not all_uploaded["flag"] and job_minutes() < CHAIN_AT_MIN:
+                  time.sleep(30)
+              if not all_uploaded["flag"]:
+                  chain_next_run(f"{CHAIN_AT_MIN} minutes of job time reached")
+
+          threading.Thread(target=watchdog, daemon=True).start()
+
+          def batch_files_ok(batch):
+              for i, s in batch:
+                  p = os.path.join("dl", index_to_rel[i])
+                  if not os.path.isfile(p) or os.path.getsize(p) != s:
+                      return False
+              return True
+
+          completed = 0
+          stopped_early = False
           for n, batch in enumerate(batches, start=1):
+              if job_minutes() >= STOP_BATCHES_MIN:
+                  stopped_early = True
+                  print(f"Stopping after {completed} batch(es): the job is close to GitHub's "
+                        f"{JOB_LIMIT_MIN} minute limit.", flush=True)
+                  chain_next_run("job time limit approaching")
+                  break
               select = ",".join(str(i) for i, _ in batch)
               print(f"--- Batch {n}/{len(batches)}: files {select} ---", flush=True)
-              subprocess.run([
-                  "aria2c", "--dir=dl", f"--select-file={select}",
-                  "--seed-time=0", "--enable-dht=true", "--file-allocation=none",
-                  "--bt-stop-timeout=600", "--summary-interval=30", torrent,
-              ], check=True)
+              ok = False
+              for attempt in range(1, 4):
+                  rc = subprocess.run([
+                      "aria2c", "--dir=dl", f"--select-file={select}",
+                      "--seed-time=0", "--enable-dht=true", "--file-allocation=none",
+                      "--bt-stop-timeout=600", "--summary-interval=30", torrent,
+                  ]).returncode
+                  if rc == 0 and batch_files_ok(batch):
+                      ok = True
+                      break
+                  why = f"aria2 exit {rc}" if rc else "files incomplete"
+                  print(f"Download attempt {attempt} did not finish ({why}); "
+                        f"{'retrying' if attempt < 3 else 'giving up'}", flush=True)
+                  if attempt < 3:
+                      time.sleep(120)
+              if not ok:
+                  sys.exit("Download kept failing, likely nobody is seeding. Rerun the workflow "
+                           "later; it resumes with the files that are already uploaded.")
               for p in glob.glob("dl/**/*.aria2", recursive=True):
                   os.remove(p)
+              # Drop stray partials of unselected files so only this batch is uploaded
+              expected = {index_to_rel[i]: s for i, s in batch}
+              for p in glob.glob("dl/**/*", recursive=True):
+                  if os.path.isfile(p) and os.path.relpath(p, "dl") not in expected:
+                      os.remove(p)
               api.upload_large_folder(repo_id=repo_id, repo_type="dataset", folder_path="dl")
               shutil.rmtree("dl")  # free the disk for the next batch
+              completed = n
 
-          print(f"Uploaded: https://huggingface.co/datasets/{repo_id}")
+          if stopped_early:
+              left = sum(len(b) for b in batches[completed:])
+              print(f"{left} file(s) still missing; the chained run will pick them up.", flush=True)
+          else:
+              all_uploaded["flag"] = True
+              print(f"Uploaded: https://huggingface.co/datasets/{repo_id}")
           EOF
