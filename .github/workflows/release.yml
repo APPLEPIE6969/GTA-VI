@@ -59,7 +59,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y aria2
-          pip install --upgrade huggingface_hub bencodepy
+          python -m pip install --upgrade "huggingface_hub>=0.25" bencodepy
+          python -c "import huggingface_hub; print('huggingface_hub', huggingface_hub.__version__)"
 
       - name: Fetch torrent metadata
         env:
@@ -288,7 +289,12 @@ jobs:
               for p in glob.glob("dl/**/*", recursive=True):
                   if os.path.isfile(p) and os.path.relpath(p, "dl") not in expected:
                       os.remove(p)
-              api.upload_large_folder(repo_id=repo_id, repo_type="dataset", folder_path="dl")
+              if hasattr(api, "upload_large_folder"):
+                  api.upload_large_folder(repo_id=repo_id, repo_type="dataset", folder_path="dl")
+              else:
+                  # Older huggingface_hub without upload_large_folder
+                  api.upload_folder(repo_id=repo_id, repo_type="dataset", folder_path="dl",
+                                    commit_message=f"Upload batch {n}/{len(batches)}")
               shutil.rmtree("dl")  # free the disk for the next batch
               completed = n
 
